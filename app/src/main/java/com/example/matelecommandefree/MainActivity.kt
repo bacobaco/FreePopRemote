@@ -1,10 +1,8 @@
-package com.baco.freepopremote
+package com.example.matelecommandefree
 
-import android.app.Activity
 import android.content.Context
 import android.content.pm.ActivityInfo
 import android.os.Bundle
-import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
@@ -30,17 +28,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.tananaev.adblib.AdbBase64
-import com.tananaev.adblib.AdbConnection
-import com.tananaev.adblib.AdbCrypto
-import com.tananaev.adblib.AdbStream
 import kotlinx.coroutines.*
-import java.net.Socket
-import java.security.KeyPair
-import java.security.KeyPairGenerator
-import java.security.KeyFactory
-import java.security.spec.PKCS8EncodedKeySpec
-import java.security.spec.X509EncodedKeySpec
 
 val DeepBlack = Color(0xFF0A0B0D)
 val SurfaceGray = Color(0xFF1C1E22)
@@ -51,7 +39,6 @@ val GlowBlue = Color(0xFF4285F4)
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Forcer le mode portrait
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         
         setContent {
@@ -73,72 +60,10 @@ class MainActivity : ComponentActivity() {
 fun FreeboxRemotePro() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val adbManager = remember { AdbManager(context) }
 
-    var ipAddress by remember { mutableStateOf("192.168.1.107") }
-    var isConnected by remember { mutableStateOf(false) }
-    var adbConnection by remember { mutableStateOf<AdbConnection?>(null) }
-    var showIpSettings by remember { mutableStateOf(false) }
-
-    fun getPersistentCrypto(): AdbCrypto {
-        val prefs = context.getSharedPreferences("adb_keys", Context.MODE_PRIVATE)
-        val pubKeyStr = prefs.getString("public_key", null)
-        val privKeyStr = prefs.getString("private_key", null)
-
-        val keyPair: KeyPair
-        if (pubKeyStr != null && privKeyStr != null) {
-            val keyFactory = KeyFactory.getInstance("RSA")
-            val pubKeySpec = X509EncodedKeySpec(Base64.decode(pubKeyStr, Base64.NO_WRAP))
-            val privKeySpec = PKCS8EncodedKeySpec(Base64.decode(privKeyStr, Base64.NO_WRAP))
-            keyPair = KeyPair(keyFactory.generatePublic(pubKeySpec), keyFactory.generatePrivate(privKeySpec))
-        } else {
-            val generator = KeyPairGenerator.getInstance("RSA")
-            generator.initialize(2048)
-            keyPair = generator.generateKeyPair()
-            prefs.edit()
-                .putString("public_key", Base64.encodeToString(keyPair.public.encoded, Base64.NO_WRAP))
-                .putString("private_key", Base64.encodeToString(keyPair.private.encoded, Base64.NO_WRAP))
-                .apply()
-        }
-        return AdbCrypto.loadAdbKeyPair(AndroidBase64(), keyPair)
-    }
-
-    fun connect() {
-        scope.launch(Dispatchers.IO) {
-            try {
-                val socket = Socket(ipAddress, 5555)
-                val crypto = getPersistentCrypto()
-                val connection = AdbConnection.create(socket, crypto)
-                connection.connect()
-                adbConnection = connection
-                withContext(Dispatchers.Main) {
-                    isConnected = true
-                    showIpSettings = false
-                }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    isConnected = false
-                    showIpSettings = true
-                }
-            }
-        }
-    }
-
-    LaunchedEffect(Unit) { connect() }
-
-    fun sendCommand(cmd: String) {
-        scope.launch(Dispatchers.IO) {
-            try {
-                if (adbConnection == null) connect()
-                adbConnection?.open("shell:$cmd")?.close()
-            } catch (e: Exception) { }
-        }
-    }
-
-    fun sendKey(code: Int) = sendCommand("input keyevent $code")
-    
-    fun launchApp(pkg: String) {
-        sendCommand("monkey -p $pkg -c android.intent.category.LEANBACK_LAUNCHER 1 || monkey -p $pkg -c android.intent.category.LAUNCHER 1")
-    }
+    fun sendKey(code: Int) = adbManager.sendKey(code)
+    fun launchApp(pkg: String) = adbManager.launchApp(pkg)
 
     @Composable
     fun RepeatingKey(code: Int, modifier: Modifier = Modifier, content: @Composable () -> Unit) {
@@ -149,9 +74,17 @@ fun FreeboxRemotePro() {
                     detectTapGestures(
                         onPress = {
                             val job = scope.launch(Dispatchers.IO) {
+                                var startTime = System.currentTimeMillis()
                                 while (isActive) {
-                                    sendKey(code)
-                                    delay(400)
+                                    val elapsed = System.currentTimeMillis() - startTime
+                                    val count = when {
+                                        elapsed > 6000 -> 12 // Vitesse turbo après 6s
+                                        elapsed > 3000 -> 5  // Vitesse rapide après 3s
+                                        else -> 1            // Vitesse normale
+                                    }
+                                    adbManager.sendKey(code, count)
+                                    // On garde un délai stable pour ne pas saturer l'ADB
+                                    delay(if (count > 1) 250 else 300)
                                 }
                             }
                             tryAwaitRelease()
@@ -177,7 +110,7 @@ fun FreeboxRemotePro() {
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Surface(
-                onClick = { showIpSettings = !showIpSettings },
+                onClick = { adbManager.connect() },
                 shape = RoundedCornerShape(24.dp),
                 color = SurfaceGray,
                 modifier = Modifier.height(40.dp)
@@ -186,9 +119,12 @@ fun FreeboxRemotePro() {
                     modifier = Modifier.padding(horizontal = 16.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Box(modifier = Modifier.size(8.dp).background(if(isConnected) Color.Green else Color.Red, CircleShape))
+                    Box(modifier = Modifier.size(8.dp).background(if(adbManager.isConnected) Color.Green else Color.Red, CircleShape))
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text(if(isConnected) "FREEBOX" else "DECONNECTÉ", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    Column {
+                        Text(if(adbManager.isConnected) "FREEBOX" else "DECONNECTE", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        Text(adbManager.statusMessage, color = TextGray, fontSize = 8.sp)
+                    }
                 }
             }
 
@@ -199,27 +135,6 @@ fun FreeboxRemotePro() {
             ) {
                 Icon(Icons.Default.PowerSettingsNew, null, tint = Color.White, modifier = Modifier.size(24.dp))
             }
-        }
-
-        if (showIpSettings) {
-            OutlinedTextField(
-                value = ipAddress,
-                onValueChange = { ipAddress = it },
-                label = { Text("IP Address", color = TextGray) },
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                shape = RoundedCornerShape(12.dp),
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedTextColor = Color.White,
-                    unfocusedTextColor = Color.White,
-                    focusedBorderColor = GlowBlue,
-                    unfocusedBorderColor = SurfaceGray
-                ),
-                trailingIcon = {
-                    IconButton(onClick = { connect() }) {
-                        Icon(Icons.Default.Refresh, null, tint = Color.White)
-                    }
-                }
-            )
         }
 
         // --- NUMERIC PAD ---
@@ -254,15 +169,15 @@ fun FreeboxRemotePro() {
         ) {
             ModernRockerRepeatable("VOL", Icons.Default.Add, Icons.Default.Remove, 24, 25, { sendKey(164) }, ::sendKey)
 
-            Box(modifier = Modifier.size(160.dp), contentAlignment = Alignment.Center) {
+            Box(modifier = Modifier.size(200.dp), contentAlignment = Alignment.Center) {
                 Box(modifier = Modifier.fillMaxSize().border(1.dp, Color.White.copy(alpha = 0.05f), CircleShape).background(SurfaceGray, CircleShape))
-                RepeatingKey(19, Modifier.align(Alignment.TopCenter)) { Icon(Icons.Default.KeyboardArrowUp, null, tint = TextGray, modifier = Modifier.size(32.dp)) }
-                RepeatingKey(20, Modifier.align(Alignment.BottomCenter)) { Icon(Icons.Default.KeyboardArrowDown, null, tint = TextGray, modifier = Modifier.size(32.dp)) }
-                RepeatingKey(21, Modifier.align(Alignment.CenterStart)) { Icon(Icons.Default.KeyboardArrowLeft, null, tint = TextGray, modifier = Modifier.size(32.dp)) }
-                RepeatingKey(22, Modifier.align(Alignment.CenterEnd)) { Icon(Icons.Default.KeyboardArrowRight, null, tint = TextGray, modifier = Modifier.size(32.dp)) }
+                RepeatingKey(19, Modifier.align(Alignment.TopCenter).padding(top = 10.dp)) { Icon(Icons.Default.KeyboardArrowUp, null, tint = TextGray, modifier = Modifier.size(36.dp)) }
+                RepeatingKey(20, Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp)) { Icon(Icons.Default.KeyboardArrowDown, null, tint = TextGray, modifier = Modifier.size(36.dp)) }
+                RepeatingKey(21, Modifier.align(Alignment.CenterStart).padding(start = 10.dp)) { Icon(Icons.Default.KeyboardArrowLeft, null, tint = TextGray, modifier = Modifier.size(36.dp)) }
+                RepeatingKey(22, Modifier.align(Alignment.CenterEnd).padding(end = 10.dp)) { Icon(Icons.Default.KeyboardArrowRight, null, tint = TextGray, modifier = Modifier.size(36.dp)) }
                 Surface(
                     onClick = { sendKey(23) }, shape = CircleShape, color = SurfaceGray,
-                    modifier = Modifier.size(60.dp).border(2.dp, Brush.radialGradient(listOf(GlowBlue, Color.Transparent)), CircleShape),
+                    modifier = Modifier.size(70.dp).border(2.dp, Brush.radialGradient(listOf(GlowBlue, Color.Transparent)), CircleShape),
                     tonalElevation = 8.dp
                 ) {
                     Box(contentAlignment = Alignment.Center) { Text("OK", color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 16.sp) }
@@ -281,7 +196,6 @@ fun FreeboxRemotePro() {
             }
             Spacer(modifier = Modifier.height(12.dp))
             Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
-                // Remplacement du bouton TV par Store (v1.0.8)
                 AppButton("STORE") { launchApp("com.android.vending") }
                 AppButton("NETFLIX") { launchApp("com.netflix.ninja") }
                 AppButton("YOUTUBE") { launchApp("com.google.android.youtube.tv") }
@@ -290,7 +204,7 @@ fun FreeboxRemotePro() {
 
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = "v1.0.8",
+            text = "v2.0.0 (Wi-Fi Auto)",
             color = TextGray.copy(alpha = 0.5f),
             fontSize = 9.sp,
             modifier = Modifier.align(Alignment.End).padding(end = 8.dp)
@@ -305,7 +219,14 @@ fun ModernRockerRepeatable(label: String, iconUp: ImageVector, iconDown: ImageVe
         Column(modifier = Modifier.width(56.dp).height(160.dp).clip(RoundedCornerShape(28.dp)).background(SurfaceGray), horizontalAlignment = Alignment.CenterHorizontally) {
             Box(modifier = Modifier.fillMaxWidth().weight(1f).pointerInput(keyUp) {
                 detectTapGestures(onPress = {
-                    val job = scope.launch(Dispatchers.IO) { while(isActive) { onKey(keyUp); delay(400) } }
+                    val job = scope.launch(Dispatchers.IO) {
+                        var currentDelay = 400L
+                        while(isActive) {
+                            onKey(keyUp)
+                            delay(currentDelay)
+                            if (currentDelay > 100) currentDelay -= 50
+                        }
+                    }
                     tryAwaitRelease(); job.cancel()
                 })
             }, contentAlignment = Alignment.Center) { Icon(iconUp, null, tint = Color.White) }
@@ -320,7 +241,14 @@ fun ModernRockerRepeatable(label: String, iconUp: ImageVector, iconDown: ImageVe
 
             Box(modifier = Modifier.fillMaxWidth().weight(1f).pointerInput(keyDown) {
                 detectTapGestures(onPress = {
-                    val job = scope.launch(Dispatchers.IO) { while(isActive) { onKey(keyDown); delay(400) } }
+                    val job = scope.launch(Dispatchers.IO) {
+                        var currentDelay = 400L
+                        while(isActive) {
+                            onKey(keyDown)
+                            delay(currentDelay)
+                            if (currentDelay > 100) currentDelay -= 50
+                        }
+                    }
                     tryAwaitRelease(); job.cancel()
                 })
             }, contentAlignment = Alignment.Center) { Icon(iconDown, null, tint = Color.White) }
@@ -353,8 +281,4 @@ fun ActionPill(icon: ImageVector, label: String, onClick: () -> Unit) {
         Spacer(modifier = Modifier.height(4.dp))
         Text(label, color = TextGray, fontSize = 9.sp, fontWeight = FontWeight.Bold)
     }
-}
-
-class AndroidBase64 : AdbBase64 {
-    override fun encodeToString(b: ByteArray): String { return Base64.encodeToString(b, Base64.NO_WRAP) }
 }
